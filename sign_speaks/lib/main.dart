@@ -1,4 +1,12 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 
 void main() {
@@ -12,7 +20,7 @@ class AppColors {
   // Add a slight glow effect to cards
   static List<BoxShadow> glowShadow = [
     BoxShadow(
-      color: primary.withOpacity(0.15),
+      color: primary.withValues(alpha: 0.15),
       blurRadius: 20,
       spreadRadius: 1,
       offset: const Offset(0, 4),
@@ -113,13 +121,13 @@ class _MainScreenState extends State<MainScreen> {
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
           decoration: BoxDecoration(
             color: isDark
-                ? AppColors.cardBackground.withOpacity(0.9)
-                : Colors.white.withOpacity(0.9),
+                ? AppColors.cardBackground.withValues(alpha: 0.9)
+                : Colors.white.withValues(alpha: 0.9),
             borderRadius: BorderRadius.circular(32),
             boxShadow: [
               BoxShadow(
                 color: isDark
-                    ? AppColors.primary.withOpacity(0.1)
+                    ? AppColors.primary.withValues(alpha: 0.1)
                     : Colors.black12,
                 blurRadius: 24,
                 spreadRadius: 2,
@@ -158,7 +166,7 @@ class _MainScreenState extends State<MainScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         decoration: BoxDecoration(
           color: isSelected
-              ? AppColors.primary.withOpacity(0.15)
+              ? AppColors.primary.withValues(alpha: 0.15)
               : Colors.transparent,
           borderRadius: BorderRadius.circular(20),
         ),
@@ -187,8 +195,324 @@ class _MainScreenState extends State<MainScreen> {
 // ==========================================
 // 1. LIVE DETECTION SCREEN
 // ==========================================
-class LiveDetectionScreen extends StatelessWidget {
+class LiveDetectionScreen extends StatefulWidget {
   const LiveDetectionScreen({super.key});
+
+  @override
+  State<LiveDetectionScreen> createState() => _LiveDetectionScreenState();
+}
+
+class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
+  static const String _webBackendUrl = String.fromEnvironment(
+    'SIGN_SPEAKS_API_URL',
+    defaultValue: 'http://127.0.0.1:8000/predict',
+  );
+
+  Process? _pythonProcess;
+  StreamSubscription<String>? _stdoutSub;
+  StreamSubscription<String>? _stderrSub;
+  CameraController? _cameraController;
+  Timer? _webFrameTimer;
+
+  bool _isStarting = false;
+  bool _isRunning = false;
+  bool _isSendingFrame = false;
+  List<Offset> _handLandmarks = const [];
+  String _status = 'Tap Start Detection to begin.';
+  String _detectedWord = '--';
+  double _confidence = 0.0;
+  String _aiResponse = 'Detection output will appear here.';
+
+  @override
+  void dispose() {
+    _webFrameTimer?.cancel();
+    _cameraController?.dispose();
+    _stopDetection();
+    super.dispose();
+  }
+
+  Future<void> _initializeWebCamera() async {
+    if (_cameraController?.value.isInitialized == true) {
+      return;
+    }
+
+    final cameras = await availableCameras();
+    if (cameras.isEmpty) {
+      throw Exception('No camera found for web target.');
+    }
+
+    final selectedCamera = cameras.firstWhere(
+      (camera) => camera.lensDirection == CameraLensDirection.front,
+      orElse: () => cameras.first,
+    );
+
+    final controller = CameraController(
+      selectedCamera,
+      ResolutionPreset.medium,
+      enableAudio: false,
+    );
+
+    await controller.initialize();
+    _cameraController = controller;
+  }
+
+  Future<void> _sendFrameToWebBackend(Uint8List bytes) async {
+    final request = http.MultipartRequest('POST', Uri.parse(_webBackendUrl))
+      ..files.add(
+        http.MultipartFile.fromBytes('frame', bytes, filename: 'frame.jpg'),
+      );
+
+    final streamedResponse = await request.send();
+    final body = await streamedResponse.stream.bytesToString();
+
+    if (streamedResponse.statusCode != 200) {
+      throw Exception('Backend error (${streamedResponse.statusCode}): $body');
+    }
+
+    final decoded = jsonDecode(body) as Map<String, dynamic>;
+    final word = (decoded['word'] as String?) ?? '--';
+    final confidence = (decoded['confidence'] as num?)?.toDouble() ?? 0.0;
+    final status = (decoded['status'] as String?) ?? 'Detecting...';
+    final handDetected = (decoded['hand_detected'] as bool?) ?? false;
+    final landmarksRaw = (decoded['landmarks'] as List<dynamic>? ?? const []);
+
+    final landmarks = landmarksRaw
+        .whereType<Map<String, dynamic>>()
+        .map((point) {
+          final x = (point['x'] as num?)?.toDouble();
+          final y = (point['y'] as num?)?.toDouble();
+          if (x == null || y == null) {
+            return null;
+          }
+          return Offset(x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+        })
+        .whereType<Offset>()
+        .toList(growable: false);
+
+    if (!mounted) return;
+    setState(() {
+      _detectedWord = word.toUpperCase();
+      _confidence = confidence.clamp(0.0, 1.0);
+      _status = handDetected ? status : 'No hand detected. Show hand in frame.';
+      _handLandmarks = landmarks;
+      _aiResponse =
+          'Detected "$word" with ${(confidence * 100).toStringAsFixed(1)}% confidence.';
+    });
+  }
+
+  Future<void> _captureAndSendWebFrame() async {
+    if (!_isRunning || _isSendingFrame) return;
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) return;
+
+    _isSendingFrame = true;
+    try {
+      final photo = await controller.takePicture();
+      final bytes = await photo.readAsBytes();
+      await _sendFrameToWebBackend(bytes);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _status =
+            'Web detection failed. Start Python API: python web_api.py (${error.toString()})';
+      });
+    } finally {
+      _isSendingFrame = false;
+    }
+  }
+
+  Future<void> _startWebDetection() async {
+    setState(() {
+      _isStarting = true;
+      _status = 'Initializing web camera...';
+      _aiResponse = 'Connecting to Python API at $_webBackendUrl';
+    });
+
+    try {
+      await _initializeWebCamera();
+
+      if (!mounted) return;
+      setState(() {
+        _isRunning = true;
+        _isStarting = false;
+        _status = 'Camera started. Sending frames to Python API...';
+      });
+
+      _webFrameTimer?.cancel();
+      _webFrameTimer = Timer.periodic(
+        const Duration(milliseconds: 120),
+        (_) => _captureAndSendWebFrame(),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isRunning = false;
+        _isStarting = false;
+        _status = 'Could not start web detection: ${error.toString()}';
+      });
+    }
+  }
+
+  Future<Process?> _startPythonProcess() async {
+    final candidatesForScript = <String>[
+      '${Directory.current.path}${Platform.pathSeparator}app.py',
+      '${Directory.current.path}${Platform.pathSeparator}sign_speaks${Platform.pathSeparator}app.py',
+    ];
+
+    String? scriptPath;
+    for (final path in candidatesForScript) {
+      if (File(path).existsSync()) {
+        scriptPath = path;
+        break;
+      }
+    }
+
+    if (scriptPath == null) {
+      return null;
+    }
+
+    final workingDirectory = File(scriptPath).parent.path;
+    final candidates = <List<String>>[
+      ['python', scriptPath],
+      ['py', scriptPath],
+    ];
+
+    for (final command in candidates) {
+      try {
+        return await Process.start(
+          command.first,
+          command.sublist(1),
+          workingDirectory: workingDirectory,
+          runInShell: true,
+        );
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  void _handlePythonLine(String line) {
+    if (!mounted || line.trim().isEmpty) return;
+
+    if (line.startsWith('DETECTION|')) {
+      final parts = line.split('|');
+      final values = <String, String>{};
+
+      for (final part in parts.skip(1)) {
+        final kv = part.split('=');
+        if (kv.length == 2) {
+          values[kv[0]] = kv[1];
+        }
+      }
+
+      final word = values['word'] ?? '--';
+      final confidence = double.tryParse(values['confidence'] ?? '') ?? 0.0;
+
+      setState(() {
+        _detectedWord = word.toUpperCase();
+        _confidence = confidence.clamp(0.0, 1.0);
+        _status = 'Detecting...';
+        _aiResponse = 'Detected "$word" with ${(confidence * 100).toStringAsFixed(1)}% confidence.';
+      });
+      return;
+    }
+
+    if (line.startsWith('STATUS|')) {
+      final statusValue = line.replaceFirst('STATUS|', '');
+      setState(() {
+        _status = 'Status: $statusValue';
+      });
+      return;
+    }
+  }
+
+  Future<void> _startDetection() async {
+    if (_isRunning || _isStarting) return;
+
+    if (kIsWeb) {
+      await _startWebDetection();
+      return;
+    }
+
+    if (!(Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
+      setState(() {
+        _status =
+            'Python integration works on desktop app targets only (Windows/Linux/macOS).';
+      });
+      return;
+    }
+
+    setState(() {
+      _isStarting = true;
+      _status = 'Starting Python detector...';
+      _aiResponse = 'Launching camera and model...';
+    });
+
+    final process = await _startPythonProcess();
+    if (!mounted) return;
+
+    if (process == null) {
+      setState(() {
+        _isStarting = false;
+        _status = 'Could not start Python. Ensure python/py is installed and in PATH.';
+      });
+      return;
+    }
+
+    _pythonProcess = process;
+    _stdoutSub = process.stdout
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen(_handlePythonLine);
+
+    _stderrSub = process.stderr
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen((line) {
+          if (!mounted || line.trim().isEmpty) return;
+          setState(() {
+            _status = 'Python: $line';
+          });
+        });
+
+    setState(() {
+      _isStarting = false;
+      _isRunning = true;
+      _status = 'Detector started. Camera should open now.';
+    });
+
+    process.exitCode.then((_) {
+      if (!mounted) return;
+      setState(() {
+        _isRunning = false;
+        _status = 'Detector stopped.';
+      });
+    });
+  }
+
+  Future<void> _stopDetection() async {
+    _webFrameTimer?.cancel();
+    _webFrameTimer = null;
+    await _cameraController?.dispose();
+    _cameraController = null;
+
+    await _stdoutSub?.cancel();
+    await _stderrSub?.cancel();
+    _stdoutSub = null;
+    _stderrSub = null;
+
+    final process = _pythonProcess;
+    _pythonProcess = null;
+    process?.kill(ProcessSignal.sigterm);
+
+    if (mounted) {
+      setState(() {
+        _isRunning = false;
+        _isStarting = false;
+        _status = 'Detection stopped.';
+        _handLandmarks = const [];
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -202,13 +526,11 @@ class LiveDetectionScreen extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Header
               const Text(
                 'Live Detection',
                 style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 20),
-              // Camera Feed
               Expanded(
                 flex: 4,
                 child: Container(
@@ -225,36 +547,52 @@ class LiveDetectionScreen extends StatelessWidget {
                             ),
                           ],
                     border: Border.all(
-                      color: AppColors.primary.withOpacity(0.3),
+                      color: AppColors.primary.withValues(alpha: 0.3),
                       width: 2,
                     ),
                   ),
                   child: Stack(
                     alignment: Alignment.center,
                     children: [
-                      // Simulated Camera Feed
-                      const Icon(
-                        Icons.camera_alt_outlined,
-                        color: Colors.white24,
-                        size: 80,
-                      ),
-                      // Overlay Bounding Box
-                      Positioned(
+                      if (kIsWeb &&
+                          _cameraController != null &&
+                          _cameraController!.value.isInitialized)
+                        ClipRRect(
+                          borderRadius:
+                              BorderRadius.circular(AppStyles.cardRadius - 2),
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              CameraPreview(_cameraController!),
+                              CustomPaint(
+                                painter: _HandLandmarksPainter(
+                                  landmarks: _handLandmarks,
+                                  color: AppColors.primary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      else
+                        const Icon(
+                          Icons.camera_alt_outlined,
+                          color: Colors.white24,
+                          size: 80,
+                        ),
+                      const Positioned(
                         top: 40,
                         bottom: 40,
                         left: 40,
                         right: 40,
-                        child: Container(
+                        child: DecoratedBox(
                           decoration: BoxDecoration(
-                            border: Border.all(
-                              color: AppColors.primary,
-                              width: 2,
+                            border: Border.fromBorderSide(
+                              BorderSide(color: AppColors.primary, width: 2),
                             ),
-                            borderRadius: BorderRadius.circular(16),
+                            borderRadius: BorderRadius.all(Radius.circular(16)),
                           ),
                         ),
                       ),
-                      // Top indicator
                       Positioned(
                         top: 16,
                         right: 16,
@@ -264,22 +602,22 @@ class LiveDetectionScreen extends StatelessWidget {
                             vertical: 6,
                           ),
                           decoration: BoxDecoration(
-                            color: AppColors.primary.withOpacity(0.2),
+                            color: AppColors.primary.withValues(alpha: 0.2),
                             borderRadius: BorderRadius.circular(20),
                             border: Border.all(color: AppColors.primary),
                           ),
-                          child: const Row(
+                          child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               Icon(
                                 Icons.circle,
-                                color: Colors.redAccent,
+                                color: _isRunning ? Colors.redAccent : Colors.grey,
                                 size: 10,
                               ),
-                              SizedBox(width: 6),
+                              const SizedBox(width: 6),
                               Text(
-                                "LIVE",
-                                style: TextStyle(
+                                _isRunning ? 'LIVE' : 'IDLE',
+                                style: const TextStyle(
                                   color: AppColors.primary,
                                   fontWeight: FontWeight.bold,
                                   fontSize: 12,
@@ -294,8 +632,6 @@ class LiveDetectionScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 20),
-
-              // Detected Gesture
               Container(
                 padding: AppStyles.cardPadding,
                 decoration: BoxDecoration(
@@ -312,9 +648,9 @@ class LiveDetectionScreen extends StatelessWidget {
                 ),
                 child: Column(
                   children: [
-                    const Text(
-                      'HELLO',
-                      style: TextStyle(
+                    Text(
+                      _detectedWord,
+                      style: const TextStyle(
                         fontSize: 48,
                         fontWeight: FontWeight.w900,
                         letterSpacing: 2,
@@ -333,8 +669,8 @@ class LiveDetectionScreen extends StatelessWidget {
                         Expanded(
                           child: ClipRRect(
                             borderRadius: BorderRadius.circular(10),
-                            child: const LinearProgressIndicator(
-                              value: 0.95,
+                            child: LinearProgressIndicator(
+                              value: _confidence,
                               backgroundColor: Colors.white12,
                               color: AppColors.primary,
                               minHeight: 8,
@@ -342,22 +678,26 @@ class LiveDetectionScreen extends StatelessWidget {
                           ),
                         ),
                         const SizedBox(width: 12),
-                        const Text(
-                          '95%',
-                          style: TextStyle(fontWeight: FontWeight.bold),
+                        Text(
+                          '${(_confidence * 100).toStringAsFixed(1)}%',
+                          style: const TextStyle(fontWeight: FontWeight.bold),
                         ),
                       ],
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      _status,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: Colors.grey),
                     ),
                   ],
                 ),
               ),
               const SizedBox(height: 20),
-
-              // AI Response Bubble
               Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                  color: AppColors.primary.withOpacity(0.15),
+                  color: AppColors.primary.withValues(alpha: 0.15),
                   borderRadius: const BorderRadius.only(
                     topLeft: Radius.circular(24),
                     topRight: Radius.circular(24),
@@ -365,30 +705,77 @@ class LiveDetectionScreen extends StatelessWidget {
                     bottomLeft: Radius.circular(4),
                   ),
                 ),
-                child: const Row(
+                child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Icon(
+                    const Icon(
                       Icons.auto_awesome,
                       color: AppColors.primary,
                       size: 24,
                     ),
-                    SizedBox(width: 12),
+                    const SizedBox(width: 12),
                     Expanded(
                       child: Text(
-                        "Hello! How can I help you today?",
-                        style: TextStyle(fontSize: 16, height: 1.4),
+                        _aiResponse,
+                        style: const TextStyle(fontSize: 16, height: 1.4),
                       ),
                     ),
                   ],
                 ),
               ),
-              const SizedBox(height: 80), // Space for bottom nav
+              const SizedBox(height: 16),
+              ElevatedButton(
+                onPressed: _isStarting
+                    ? null
+                    : (_isRunning ? _stopDetection : _startDetection),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.primary,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                child: Text(
+                  _isStarting
+                      ? 'Starting...'
+                      : (_isRunning ? 'Stop Detection' : 'Start Detection'),
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+              const SizedBox(height: 20),
             ],
           ),
         ),
       ),
     );
+  }
+}
+
+class _HandLandmarksPainter extends CustomPainter {
+  final List<Offset> landmarks;
+  final Color color;
+
+  _HandLandmarksPainter({required this.landmarks, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (landmarks.isEmpty) return;
+
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.fill;
+
+    for (final point in landmarks) {
+      final x = point.dx * size.width;
+      final y = point.dy * size.height;
+      canvas.drawCircle(Offset(x, y), 4, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _HandLandmarksPainter oldDelegate) {
+    return oldDelegate.landmarks != landmarks || oldDelegate.color != color;
   }
 }
 
@@ -455,7 +842,7 @@ class HistoryScreen extends StatelessWidget {
                           Container(
                             padding: const EdgeInsets.all(12),
                             decoration: BoxDecoration(
-                              color: AppColors.primary.withOpacity(0.1),
+                              color: AppColors.primary.withValues(alpha: 0.1),
                               shape: BoxShape.circle,
                             ),
                             child: const Icon(
@@ -495,7 +882,7 @@ class HistoryScreen extends StatelessWidget {
                                   vertical: 4,
                                 ),
                                 decoration: BoxDecoration(
-                                  color: Colors.green.withOpacity(0.1),
+                                  color: Colors.green.withValues(alpha: 0.1),
                                   borderRadius: BorderRadius.circular(8),
                                 ),
                                 child: Text(

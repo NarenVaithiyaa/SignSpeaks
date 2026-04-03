@@ -43,3 +43,35 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.venv/
+.env
+
+# IDE / Editor folders
+.vscode/
+.idea/
+
+# Deep Learning / MediaPipe Specific
+*.h5
+*.keras
+*.task
+*.npy
+MP_Data/
+videos/
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+
+# OS generated files
+.DS_Store
+Thumbs.db

@@ -1,17 +1,38 @@
 # sign_speaks
 
-A new Flutter project.
+SignSpeaks Flutter app with live sign-language detection.
 
-## Getting Started
+## Live Detection on Chrome/Web
 
-This project is a starting point for a Flutter application.
+For web targets, Flutter cannot start local Python processes directly from the browser.
+So the app uses a local Python API (`web_api.py`) and sends camera frames to it.
 
-A few resources to get you started if this is your first Flutter project:
+### 1) Start Python backend
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+From this folder (`sign_speaks`):
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+```bash
+pip install -r requirements-web.txt
+python web_api.py
+```
+
+Backend starts at `http://127.0.0.1:8000`.
+
+### 2) Start Flutter web app
+
+In another terminal:
+
+```bash
+flutter pub get
+flutter run -d chrome
+```
+
+Open **Live Detection** and tap **Start Detection**.
+
+## Optional: custom API URL
+
+If backend is not on the default URL, pass compile-time define:
+
+```bash
+flutter run -d chrome --dart-define=SIGN_SPEAKS_API_URL=http://127.0.0.1:8000/predict
+```
